@@ -139,6 +139,8 @@ CREATE TABLE agent_instance_task (
     state                  TEXT        NOT NULL,
     status_timestamp       TIMESTAMPTZ,
     data                   BYTEA       NOT NULL,
+    -- NULL means data is plaintext; a value names the key that encrypted it.
+    encryption_key_id      TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     initial_message_id     TEXT,
@@ -171,8 +173,14 @@ CREATE TABLE agent_instance_task_event (
     history_id UUID        CONSTRAINT agent_instance_task_event_instance_id_not_null NOT NULL REFERENCES a2a_context(id) ON DELETE CASCADE,
     task_id    TEXT,
     data       BYTEA       NOT NULL,
+    -- NULL means data is plaintext; a value names the key that encrypted it.
+    encryption_key_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     message_id TEXT,
+    -- Set only for an archived message row (message_id NOT NULL); who sent it
+    -- (e.g. ROLE_USER, ROLE_AGENT), duplicated in plaintext from the encrypted
+    -- Message so it stays queryable without decrypting.
+    role TEXT,
     -- Creation events retain task indexes; admitted reply messages retain retry hashes.
     task_position BIGINT,
     initial_message_id TEXT,
@@ -184,7 +192,8 @@ CREATE TABLE agent_instance_task_event (
         OR (snapshot_atespace IS NOT NULL AND snapshot_uri IS NOT NULL AND snapshot_content_scope IS NOT NULL)),
     CHECK (task_position IS NULL OR (task_position > 0 AND task_id IS NOT NULL AND message_id IS NULL)),
     CHECK (task_position IS NOT NULL OR initial_message_id IS NULL),
-    CHECK (request_hash IS NULL OR task_position IS NOT NULL OR message_id IS NOT NULL)
+    CHECK (request_hash IS NULL OR task_position IS NOT NULL OR message_id IS NOT NULL),
+    CHECK (role IS NULL OR message_id IS NOT NULL)
 );
 CREATE UNIQUE INDEX agent_instance_task_event_creation_idx
     ON agent_instance_task_event (history_id, task_id) WHERE task_position IS NOT NULL;

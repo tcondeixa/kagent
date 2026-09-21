@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"crypto/sha256"
 	"testing"
 
@@ -37,8 +38,14 @@ func TestMalformedProtobufPayloads(t *testing.T) {
 			_, err := toRuntimeRevision(runtimeRevisionRow{AgentCard: data})
 			return err
 		}},
-		{"task", func(data []byte) error { _, err := unmarshalAgentInstanceTask(data); return err }},
-		{"event", func(data []byte) error { _, err := unmarshalAgentInstanceTaskEvent(data); return err }},
+		{"task", func(data []byte) error {
+			_, err := (&Client{}).unmarshalAgentInstanceTask(context.Background(), data, nil, "")
+			return err
+		}},
+		{"event", func(data []byte) error {
+			_, err := (&Client{}).unmarshalAgentInstanceTaskEvent(context.Background(), data, nil, "", "")
+			return err
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) { require.Error(t, test.decode([]byte{0xff})) })
 	}
@@ -79,7 +86,7 @@ func TestA2AProtobufTaskEventScope(t *testing.T) {
 			require.NoError(t, err)
 			data, err := proto.Marshal(original)
 			require.NoError(t, err)
-			_, err = saveTaskProjection(ctx, q, instanceRow.HistoryID, original.Id, string(a2a.TaskStateWorking), nil, data)
+			_, err = saveTaskProjection(ctx, q, instanceRow.HistoryID, original.Id, string(a2a.TaskStateWorking), nil, data, nil)
 			require.NoError(t, err)
 			require.NoError(t, client.StoreAgentInstanceTaskEvent(ctx, instance.Id, next, test.event, nil))
 			row, err := readAgentInstanceTask(ctx, q, instanceRow.HistoryID, original.Id)
@@ -106,7 +113,7 @@ func TestA2AProtobufTaskEventScope(t *testing.T) {
 	}
 	data, err := proto.Marshal(original)
 	require.NoError(t, err)
-	_, err = saveTaskProjection(ctx, q, instanceRow.HistoryID, original.Id, string(a2a.TaskStateWorking), nil, data)
+	_, err = saveTaskProjection(ctx, q, instanceRow.HistoryID, original.Id, string(a2a.TaskStateWorking), nil, data, nil)
 	require.NoError(t, err)
 	interrupted, err := client.InterruptActiveAgentInstanceTask(ctx, instance.Id, original.Id)
 	require.NoError(t, err)
@@ -187,7 +194,7 @@ func TestProtobufPersistenceLifecycle(t *testing.T) {
 	addUnknown(futureTask.Status.Message.Parts[0])
 	futureData, err := proto.Marshal(futureTask)
 	require.NoError(t, err)
-	_, err = saveTaskProjection(ctx, q, taskRow.HistoryID, taskRow.ID, taskRow.State, taskRow.StatusTimestamp, futureData)
+	_, err = saveTaskProjection(ctx, q, taskRow.HistoryID, taskRow.ID, taskRow.State, taskRow.StatusTimestamp, futureData, nil)
 	require.NoError(t, err)
 	futureEvent, err := proto.Marshal(&a2apb.StreamResponse{Payload: &a2apb.StreamResponse_Task{Task: futureTask}})
 	require.NoError(t, err)

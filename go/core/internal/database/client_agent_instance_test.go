@@ -136,7 +136,7 @@ func TestAgentInstanceTasksAreDurableAndExclusive(t *testing.T) {
 	if err := db.QueryRow(ctx, `SELECT data FROM agent_instance_task WHERE history_id = '11111111-1111-4111-8111-111111111111' AND id = 'task-1'`).Scan(&projectionData); err != nil {
 		t.Fatal(err)
 	}
-	projection, err := unmarshalAgentInstanceTask(projectionData)
+	projection, err := (&Client{}).unmarshalAgentInstanceTask(ctx, projectionData, nil, "task-1")
 	if err != nil || len(projection.History) != 0 {
 		t.Fatalf("stored task projection history = %#v, error %v", projection.History, err)
 	}

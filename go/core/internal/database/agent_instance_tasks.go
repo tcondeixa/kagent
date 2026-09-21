@@ -34,11 +34,11 @@ func (c *Client) CreateAgentInstanceTask(ctx context.Context, instanceID string,
 	if err != nil {
 		return nil, false, err
 	}
-	taskData, err := proto.Marshal(initial)
+	taskData, taskKeyID, err := c.encryptPayload(ctx, initial, string(task.ID), "")
 	if err != nil {
 		return nil, false, err
 	}
-	creationData, err := proto.Marshal(creation)
+	creationData, creationKeyID, err := c.encryptPayload(ctx, creation, string(task.ID), "")
 	if err != nil {
 		return nil, false, err
 	}
@@ -56,19 +56,20 @@ func (c *Client) CreateAgentInstanceTask(ctx context.Context, instanceID string,
 			return fmt.Errorf("task context does not match AgentInstance")
 		}
 		existing, err := queryOne(ctx, tx, `
-			SELECT history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id,
-			    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position
+			SELECT history_id, id, state, status_timestamp, data, encryption_key_id, created_at, updated_at,
+			    initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope,
+			    history_sequence, position
 			FROM agent_instance_task WHERE history_id = $1 AND initial_message_id = $2
 		`, pgx.RowToStructByName[agentInstanceTaskRow], historyID, message.ID)
 		if err == nil {
 			if !bytes.Equal(existing.RequestHash, requestHash) {
 				return ErrIdempotencyConflict
 			}
-			result, err = unmarshalAgentInstanceTask(existing.Data)
+			result, err = c.unmarshalAgentInstanceTask(ctx, existing.Data, existing.EncryptionKeyID, existing.ID)
 			if err != nil {
 				return err
 			}
-			return loadAgentInstanceTaskHistories(ctx, tx, historyID, []*a2a.Task{result}, nil)
+			return c.loadAgentInstanceTaskHistories(ctx, tx, historyID, []*a2a.Task{result}, nil)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("get AgentInstance task for message %s: %w", message.ID, err)
@@ -78,18 +79,19 @@ func (c *Client) CreateAgentInstanceTask(ctx context.Context, instanceID string,
 		}
 		row, err := queryOne(ctx, tx, `
 			INSERT INTO agent_instance_task (
-			    history_id, id, state, status_timestamp, data, initial_message_id, request_hash
+			    history_id, id, state, status_timestamp, data, encryption_key_id, initial_message_id, request_hash
 			)
-			SELECT $1, $2, $3, $4, $5, $6, $7
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8
 			WHERE NOT EXISTS (
 			    SELECT 1 FROM agent_instance_checkpoint
-			    WHERE source_instance_id = $8 AND state = 'CREATING'
+			    WHERE source_instance_id = $9 AND state = 'CREATING'
 			)
-			RETURNING history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id,
-			    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position
+			RETURNING history_id, id, state, status_timestamp, data, encryption_key_id, created_at, updated_at,
+			    initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope,
+			    history_sequence, position
 		`,
 			pgx.RowToStructByName[agentInstanceTaskRow], historyID, string(task.ID), string(task.Status.State),
-			task.Status.Timestamp, taskData, &message.ID, requestHash, instance.ID,
+			task.Status.Timestamp, taskData, taskKeyID, &message.ID, requestHash, instance.ID,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("AgentInstance %s has a checkpoint being created: %w", instanceID, ErrConflict)
@@ -105,6 +107,7 @@ func (c *Client) CreateAgentInstanceTask(ctx context.Context, instanceID string,
 			HistoryID:        historyID,
 			TaskID:           &row.ID,
 			Data:             creationData,
+			EncryptionKeyID:  creationKeyID,
 			TaskPosition:     &row.Position,
 			InitialMessageID: row.InitialMessageID,
 			RequestHash:      row.RequestHash,
@@ -112,7 +115,7 @@ func (c *Client) CreateAgentInstanceTask(ctx context.Context, instanceID string,
 		}); err != nil {
 			return fmt.Errorf("record task creation: %w", err)
 		}
-		_, err = storeAgentInstanceTaskMessages(ctx, tx, historyID, string(task.ID), task.ContextID, task.History)
+		_, err = c.storeAgentInstanceTaskMessages(ctx, tx, historyID, string(task.ID), task.ContextID, task.History)
 		return err
 	})
 	if err != nil {
@@ -156,7 +159,7 @@ func (c *Client) ContinueAgentInstanceTask(ctx context.Context, instanceID strin
 		if err != nil {
 			return notFoundOr(err)
 		}
-		result, err = unmarshalAgentInstanceTask(row.Data)
+		result, err = c.unmarshalAgentInstanceTask(ctx, row.Data, row.EncryptionKeyID, row.ID)
 		if err != nil {
 			return err
 		}
@@ -168,7 +171,7 @@ func (c *Client) ContinueAgentInstanceTask(ctx context.Context, instanceID strin
 			if !bytes.Equal(hash, requestHash) {
 				return ErrIdempotencyConflict
 			}
-			return loadAgentInstanceTaskHistories(ctx, tx, instance.HistoryID, []*a2a.Task{result}, nil)
+			return c.loadAgentInstanceTaskHistories(ctx, tx, instance.HistoryID, []*a2a.Task{result}, nil)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -197,7 +200,7 @@ func (c *Client) ContinueAgentInstanceTask(ctx context.Context, instanceID strin
 				return fmt.Errorf("ask-user response does not match the pending request: %w", ErrFailedPrecondition)
 			}
 		}
-		if err := loadAgentInstanceTaskHistories(ctx, tx, instance.HistoryID, []*a2a.Task{result}, nil); err != nil {
+		if err := c.loadAgentInstanceTaskHistories(ctx, tx, instance.HistoryID, []*a2a.Task{result}, nil); err != nil {
 			return err
 		}
 		waiting = result
@@ -218,7 +221,7 @@ func (c *Client) ContinueAgentInstanceTask(ctx context.Context, instanceID strin
 		submitted.History = append(submitted.History, message)
 		now := time.Now().UTC()
 		submitted.Status = a2a.TaskStatus{State: a2a.TaskStateSubmitted, Timestamp: &now}
-		if err := storeAgentInstanceTaskEvent(ctx, tx, instance, &submitted, message, nil); err != nil {
+		if err := c.storeAgentInstanceTaskEvent(ctx, tx, instance, &submitted, message, nil); err != nil {
 			return err
 		}
 		if err := execSQL(ctx, tx, `
@@ -245,11 +248,13 @@ const taskInterruptedMessage = "The turn was interrupted before it completed, an
 // tasks are not active. Callers authorize instance access.
 func (c *Client) GetActiveAgentInstanceTask(ctx context.Context, instanceID string) (*a2a.Task, error) {
 	type activeTaskRow struct {
-		HistoryID uuid.UUID
-		Data      []byte
+		HistoryID       uuid.UUID
+		ID              string
+		Data            []byte
+		EncryptionKeyID *string
 	}
 	row, err := queryOne(ctx, c.db, `
-		SELECT t.history_id, t.data
+		SELECT t.history_id, t.id, t.data, t.encryption_key_id
 		FROM agent_instance_task t
 		JOIN agent_instance i ON i.history_id = t.history_id
 		WHERE i.id = $1
@@ -265,9 +270,9 @@ func (c *Client) GetActiveAgentInstanceTask(ctx context.Context, instanceID stri
 	if err != nil {
 		return nil, fmt.Errorf("get active AgentInstance task: %w", notFoundOr(err))
 	}
-	task, err := unmarshalAgentInstanceTask(row.Data)
+	task, err := c.unmarshalAgentInstanceTask(ctx, row.Data, row.EncryptionKeyID, row.ID)
 	if err == nil {
-		err = loadAgentInstanceTaskHistories(ctx, c.db, row.HistoryID, []*a2a.Task{task}, nil)
+		err = c.loadAgentInstanceTaskHistories(ctx, c.db, row.HistoryID, []*a2a.Task{task}, nil)
 	}
 	return task, err
 }
@@ -284,8 +289,9 @@ func (c *Client) InterruptActiveAgentInstanceTask(ctx context.Context, instanceI
 	}
 	err = c.withTx(ctx, func(tx pgx.Tx) error {
 		row, err := queryOne(ctx, tx, `
-			SELECT history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id,
-			    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position FROM
+			SELECT history_id, id, state, status_timestamp, data, encryption_key_id, created_at, updated_at,
+			    initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope,
+			    history_sequence, position FROM
 			    agent_instance_task
 			WHERE history_id = $1
 			  AND state NOT IN (
@@ -307,8 +313,12 @@ func (c *Client) InterruptActiveAgentInstanceTask(ctx context.Context, instanceI
 		if row.ID != taskID {
 			return nil
 		}
+		plaintext, err := c.decryptPayload(ctx, row.Data, row.EncryptionKeyID, row.ID, "")
+		if err != nil {
+			return fmt.Errorf("decode interrupted task: %w", err)
+		}
 		task := &a2apb.Task{}
-		if err := proto.Unmarshal(row.Data, task); err != nil {
+		if err := proto.Unmarshal(plaintext, task); err != nil {
 			return fmt.Errorf("decode interrupted task: %w", err)
 		}
 		if _, err := pbconv.FromProtoTask(task); err != nil {
@@ -332,24 +342,25 @@ func (c *Client) InterruptActiveAgentInstanceTask(ctx context.Context, instanceI
 			return err
 		}
 		task.History = nil
-		data, err := proto.Marshal(task)
+		data, keyID, err := c.encryptPayload(ctx, task, task.Id, "")
 		if err != nil {
 			return err
 		}
-		if _, err := saveTaskProjection(ctx, tx, instance.HistoryID, task.Id, string(a2a.TaskStateFailed), &now, data); err != nil {
+		if _, err := saveTaskProjection(ctx, tx, instance.HistoryID, task.Id, string(a2a.TaskStateFailed), &now, data, keyID); err != nil {
 			return fmt.Errorf("interrupt AgentInstance task %s: %w", task.Id, err)
 		}
-		if _, err := storeProtoTaskMessages(ctx, tx, instance.HistoryID, task.Id, task.ContextId, messages); err != nil {
+		if _, err := c.storeProtoTaskMessages(ctx, tx, instance.HistoryID, task.Id, task.ContextId, messages); err != nil {
 			return fmt.Errorf("record AgentInstance task interruption: %w", err)
 		}
-		eventData, err := proto.Marshal(event)
+		eventData, eventKeyID, err := c.encryptPayload(ctx, event, task.Id, "")
 		if err != nil {
 			return err
 		}
 		if _, err := insertTaskEvent(ctx, tx, taskEventWrite{
-			HistoryID: instance.HistoryID,
-			TaskID:    &task.Id,
-			Data:      eventData,
+			HistoryID:       instance.HistoryID,
+			TaskID:          &task.Id,
+			Data:            eventData,
+			EncryptionKeyID: eventKeyID,
 		}); err != nil {
 			return fmt.Errorf("record task interruption status: %w", err)
 		}
@@ -375,7 +386,7 @@ func (c *Client) StoreAgentInstanceTaskEvent(ctx context.Context, instanceID str
 		if err != nil {
 			return notFoundOr(err)
 		}
-		return storeAgentInstanceTaskEvent(ctx, tx, instance, task, event, snapshot)
+		return c.storeAgentInstanceTaskEvent(ctx, tx, instance, task, event, snapshot)
 	})
 	if err != nil {
 		return fmt.Errorf("store AgentInstance task update: %w", err)
@@ -387,7 +398,7 @@ func (c *Client) StoreAgentInstanceTaskEvent(ctx context.Context, instanceID str
 // snapshot in the caller's transaction. The caller must hold the instance row lock;
 // checkpoint creation blocks the write. Continuation admission validates the waiting
 // state and retry identity before invoking this shared persistence operation.
-func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentInstanceRow, task *a2a.Task, event a2a.Event, snapshot *AgentInstanceTaskSnapshot) error {
+func (c *Client) storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentInstanceRow, task *a2a.Task, event a2a.Event, snapshot *AgentInstanceTaskSnapshot) error {
 	historyID := instance.HistoryID
 	if event.TaskInfo().ContextID != instance.ContextID.String() || task.ContextID != instance.ContextID.String() {
 		return fmt.Errorf("task event context does not match AgentInstance")
@@ -404,12 +415,17 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 	var sequence int64
 	var stored *a2apb.Task
 	if row, err := queryOne(ctx, tx, `
-		SELECT history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id,
-		    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position FROM
+		SELECT history_id, id, state, status_timestamp, data, encryption_key_id, created_at, updated_at,
+		    initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope,
+		    history_sequence, position FROM
 		    agent_instance_task WHERE history_id = $1 AND id = $2 FOR UPDATE
 	`, pgx.RowToStructByName[agentInstanceTaskRow], historyID, string(task.ID)); err == nil {
+		plaintext, err := c.decryptPayload(ctx, row.Data, row.EncryptionKeyID, row.ID, "")
+		if err != nil {
+			return fmt.Errorf("decode stored task: %w", err)
+		}
 		stored = &a2apb.Task{}
-		if err := proto.Unmarshal(row.Data, stored); err != nil {
+		if err := proto.Unmarshal(plaintext, stored); err != nil {
 			return fmt.Errorf("decode stored task: %w", err)
 		}
 		if _, err := pbconv.FromProtoTask(stored); err != nil {
@@ -426,7 +442,7 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 			}
 		}
 		if len(messages) > 0 {
-			sequence, err = storeProtoTaskMessages(ctx, tx, historyID, string(task.ID), task.ContextID, messages)
+			sequence, err = c.storeProtoTaskMessages(ctx, tx, historyID, string(task.ID), task.ContextID, messages)
 			if err != nil {
 				return fmt.Errorf("archive AgentInstance task history: %w", err)
 			}
@@ -439,11 +455,11 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 	if err != nil {
 		return err
 	}
-	data, err := proto.Marshal(stored)
+	data, keyID, err := c.encryptPayload(ctx, stored, string(task.ID), "")
 	if err != nil {
 		return err
 	}
-	taskRow, err := saveTaskProjection(ctx, tx, historyID, string(task.ID), string(task.Status.State), task.Status.Timestamp, data)
+	taskRow, err := saveTaskProjection(ctx, tx, historyID, string(task.ID), string(task.Status.State), task.Status.Timestamp, data, keyID)
 	if err != nil {
 		if isActiveTaskConflict(err) {
 			return fmt.Errorf("AgentInstance %s already has an active task: %w", instance.ID, ErrConflict)
@@ -451,7 +467,7 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 		return fmt.Errorf("store AgentInstance task %s: %w", task.ID, err)
 	}
 	if newTask {
-		data, err := proto.Marshal(durable)
+		data, keyID, err := c.encryptPayload(ctx, durable, string(task.ID), "")
 		if err != nil {
 			return err
 		}
@@ -459,6 +475,7 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 			HistoryID:        historyID,
 			TaskID:           &taskRow.ID,
 			Data:             data,
+			EncryptionKeyID:  keyID,
 			TaskPosition:     &taskRow.Position,
 			InitialMessageID: taskRow.InitialMessageID,
 			RequestHash:      taskRow.RequestHash,
@@ -472,18 +489,19 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 	messages := agentInstanceTaskEventMessages(task, event)
 	if len(messages) > 0 {
 		var err error
-		sequence, err = storeAgentInstanceTaskMessages(ctx, tx, historyID, string(event.TaskInfo().TaskID), instance.ContextID.String(), messages)
+		sequence, err = c.storeAgentInstanceTaskMessages(ctx, tx, historyID, string(event.TaskInfo().TaskID), instance.ContextID.String(), messages)
 		if err != nil {
 			return fmt.Errorf("store AgentInstance task history: %w", err)
 		}
 	}
 	if !newTask || snapshot != nil {
-		eventData, err := proto.Marshal(durable)
+		eventData, eventKeyID, err := c.encryptPayload(ctx, durable, string(event.TaskInfo().TaskID), "")
 		if err != nil {
 			return err
 		}
 		insert := taskEventWrite{
 			HistoryID: historyID, TaskID: strPtrIfNotEmpty(string(event.TaskInfo().TaskID)), Data: eventData,
+			EncryptionKeyID: eventKeyID,
 		}
 		if snapshot != nil {
 			insert.SnapshotAtespace, insert.SnapshotURI, insert.SnapshotContentScope = &snapshot.Atespace, &snapshot.URI, &snapshot.ContentScope
@@ -517,8 +535,8 @@ func storeAgentInstanceTaskEvent(ctx context.Context, tx pgx.Tx, instance agentI
 // all history; zero skips it. Callers authorize instance access.
 func (c *Client) GetAgentInstanceTask(ctx context.Context, instanceID, taskID string, historyLength *int) (*a2a.Task, error) {
 	row, err := queryOne(ctx, c.db, `
-		SELECT t.history_id, t.id, t.state, t.status_timestamp, t.data, t.created_at, t.updated_at,
-		    t.initial_message_id, t.request_hash, t.snapshot_atespace, t.snapshot_uri,
+		SELECT t.history_id, t.id, t.state, t.status_timestamp, t.data, t.encryption_key_id, t.created_at,
+		    t.updated_at, t.initial_message_id, t.request_hash, t.snapshot_atespace, t.snapshot_uri,
 		    t.snapshot_content_scope, t.history_sequence, t.position
 		FROM agent_instance_task t
 		JOIN agent_instance i ON i.history_id = t.history_id
@@ -527,9 +545,9 @@ func (c *Client) GetAgentInstanceTask(ctx context.Context, instanceID, taskID st
 	if err != nil {
 		return nil, fmt.Errorf("get AgentInstance task %s: %w", taskID, notFoundOr(err))
 	}
-	task, err := unmarshalAgentInstanceTask(row.Data)
+	task, err := c.unmarshalAgentInstanceTask(ctx, row.Data, row.EncryptionKeyID, row.ID)
 	if err == nil {
-		err = loadAgentInstanceTaskHistories(ctx, c.db, row.HistoryID, []*a2a.Task{task}, historyLength)
+		err = c.loadAgentInstanceTaskHistories(ctx, c.db, row.HistoryID, []*a2a.Task{task}, historyLength)
 	}
 	return task, err
 }
@@ -556,9 +574,9 @@ func (c *Client) ListAgentInstanceTasks(ctx context.Context, instanceID, afterID
 		return nil, 0, fmt.Errorf("count AgentInstance tasks: %w", err)
 	}
 	rows, err := queryMany(ctx, c.db, `
-		SELECT t.history_id, t.id, t.state, t.status_timestamp, t.data, t.created_at, t.updated_at,
-		    t.initial_message_id, t.request_hash, t.snapshot_atespace, t.snapshot_uri, t.snapshot_content_scope,
-		    t.history_sequence, t.position FROM agent_instance_task t
+		SELECT t.history_id, t.id, t.state, t.status_timestamp, t.data, t.encryption_key_id, t.created_at,
+		    t.updated_at, t.initial_message_id, t.request_hash, t.snapshot_atespace, t.snapshot_uri,
+		    t.snapshot_content_scope, t.history_sequence, t.position FROM agent_instance_task t
 		WHERE t.history_id = $1
 		  AND ($2::text = '' OR t.position > (
 		      SELECT cursor.position FROM agent_instance_task cursor
@@ -578,23 +596,28 @@ func (c *Client) ListAgentInstanceTasks(ctx context.Context, instanceID, afterID
 	}
 	tasks := make([]*a2a.Task, 0, len(rows))
 	for _, row := range rows {
-		task, err := unmarshalAgentInstanceTask(row.Data)
+		task, err := c.unmarshalAgentInstanceTask(ctx, row.Data, row.EncryptionKeyID, row.ID)
 		if err != nil {
 			return nil, 0, fmt.Errorf("decode AgentInstance task %s: %w", row.ID, err)
 		}
 		tasks = append(tasks, task)
 	}
-	if err := loadAgentInstanceTaskHistories(ctx, c.db, instance.HistoryID, tasks, historyLength); err != nil {
+	if err := c.loadAgentInstanceTaskHistories(ctx, c.db, instance.HistoryID, tasks, historyLength); err != nil {
 		return nil, 0, err
 	}
 	return tasks, int(total), nil
 }
 
 // unmarshalAgentInstanceTaskEvent decodes a stored A2A event, returning an error for
-// malformed or unsupported payloads.
-func unmarshalAgentInstanceTaskEvent(data []byte) (a2a.Event, error) {
+// malformed or unsupported payloads. keyID is the row's encryption_key_id; taskID and
+// messageID reproduce the AAD supplied when the row was encrypted.
+func (c *Client) unmarshalAgentInstanceTaskEvent(ctx context.Context, data []byte, keyID *string, taskID, messageID string) (a2a.Event, error) {
+	plaintext, err := c.decryptPayload(ctx, data, keyID, taskID, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal AgentInstance task event: %w", err)
+	}
 	var pb a2apb.StreamResponse
-	if err := proto.Unmarshal(data, &pb); err != nil {
+	if err := proto.Unmarshal(plaintext, &pb); err != nil {
 		return nil, fmt.Errorf("unmarshal AgentInstance task event: %w", err)
 	}
 	event, err := pbconv.FromProtoStreamResponse(&pb)
@@ -624,7 +647,7 @@ func agentInstanceTaskEventMessages(task *a2a.Task, event a2a.Event) []*a2a.Mess
 // storeAgentInstanceTaskMessages converts and archives messages with valid IDs, returning
 // the last message's event sequence or zero for an empty list. The caller supplies a
 // transaction when these writes must commit atomically with task state.
-func storeAgentInstanceTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID, contextID string, messages []*a2a.Message) (int64, error) {
+func (c *Client) storeAgentInstanceTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID, contextID string, messages []*a2a.Message) (int64, error) {
 	converted := make([]*a2apb.Message, 0, len(messages))
 	for _, message := range messages {
 		if message == nil || message.ID == "" {
@@ -636,14 +659,14 @@ func storeAgentInstanceTaskMessages(ctx context.Context, db dbExecutor, historyI
 		}
 		converted = append(converted, event.GetMessage())
 	}
-	return storeProtoTaskMessages(ctx, db, historyID, taskID, contextID, converted)
+	return c.storeProtoTaskMessages(ctx, db, historyID, taskID, contextID, converted)
 }
 
 // storeProtoTaskMessages archives messages without changing the inputs or dropping unknown
 // protobuf fields. It fills missing task/context IDs and rejects conflicting identities.
 // Duplicate message IDs retain their original event sequence; an empty list returns zero.
 // Callers own the transaction.
-func storeProtoTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID, contextID string, messages []*a2apb.Message) (int64, error) {
+func (c *Client) storeProtoTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID, contextID string, messages []*a2apb.Message) (int64, error) {
 	var sequence int64
 	for _, message := range messages {
 		if message.GetMessageId() == "" {
@@ -654,15 +677,17 @@ func storeProtoTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.U
 			return 0, fmt.Errorf("history message changes task identity")
 		}
 		message.TaskId, message.ContextId = taskID, contextID
-		data, err := proto.Marshal(&a2apb.StreamResponse{Payload: &a2apb.StreamResponse_Message{Message: message}})
+		data, keyID, err := c.encryptPayload(ctx, &a2apb.StreamResponse{Payload: &a2apb.StreamResponse_Message{Message: message}}, taskID, message.MessageId)
 		if err != nil {
 			return 0, err
 		}
 		sequence, err = insertTaskEvent(ctx, db, taskEventWrite{
-			HistoryID: historyID,
-			TaskID:    &taskID,
-			MessageID: &message.MessageId,
-			Data:      data,
+			HistoryID:       historyID,
+			TaskID:          &taskID,
+			MessageID:       &message.MessageId,
+			Data:            data,
+			EncryptionKeyID: keyID,
+			Role:            strPtrIfNotEmpty(message.Role.String()),
 		})
 		if err != nil {
 			return 0, err
@@ -675,7 +700,7 @@ func storeProtoTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.U
 // order, limited to the latest historyLength per task. Zero clears history without a
 // query; nil or negative loads it all. Tasks without archived messages otherwise retain
 // their inline history, subject to the same limit. Malformed messages return errors.
-func loadAgentInstanceTaskHistories(ctx context.Context, db dbExecutor, historyID uuid.UUID, tasks []*a2a.Task, historyLength *int) error {
+func (c *Client) loadAgentInstanceTaskHistories(ctx context.Context, db dbExecutor, historyID uuid.UUID, tasks []*a2a.Task, historyLength *int) error {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -700,7 +725,7 @@ func loadAgentInstanceTaskHistories(ctx context.Context, db dbExecutor, historyI
 	}
 	histories := make(map[string][]*a2a.Message, len(tasks))
 	for _, row := range rows {
-		event, err := unmarshalAgentInstanceTaskEvent(row.Data)
+		event, err := c.unmarshalAgentInstanceTaskEvent(ctx, row.Data, row.EncryptionKeyID, row.TaskID, derefStr(row.MessageID))
 		if err != nil {
 			return err
 		}
@@ -726,10 +751,15 @@ func isActiveTaskConflict(err error) bool {
 }
 
 // unmarshalAgentInstanceTask decodes a stored A2A task, returning an error for malformed
-// or unsupported payloads.
-func unmarshalAgentInstanceTask(data []byte) (*a2a.Task, error) {
+// or unsupported payloads. keyID is the row's encryption_key_id; taskID reproduces the AAD
+// supplied when the row was encrypted.
+func (c *Client) unmarshalAgentInstanceTask(ctx context.Context, data []byte, keyID *string, taskID string) (*a2a.Task, error) {
+	plaintext, err := c.decryptPayload(ctx, data, keyID, taskID, "")
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal AgentInstance task: %w", err)
+	}
 	var pb a2apb.Task
-	if err := proto.Unmarshal(data, &pb); err != nil {
+	if err := proto.Unmarshal(plaintext, &pb); err != nil {
 		return nil, fmt.Errorf("unmarshal AgentInstance task: %w", err)
 	}
 	task, err := pbconv.FromProtoTask(&pb)
@@ -745,6 +775,9 @@ type agentInstanceTaskRow struct {
 	State                string
 	StatusTimestamp      *time.Time
 	Data                 []byte
+	// EncryptionKeyID is nil for a plaintext row, or the ID of the key that
+	// encrypted Data.
+	EncryptionKeyID      *string
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 	InitialMessageID     *string
@@ -757,12 +790,19 @@ type agentInstanceTaskRow struct {
 }
 
 type agentInstanceTaskEventRow struct {
-	Sequence             int64
-	HistoryID            uuid.UUID
-	TaskID               *string
-	Data                 []byte
+	Sequence  int64
+	HistoryID uuid.UUID
+	TaskID    *string
+	Data      []byte
+	// EncryptionKeyID is nil for a plaintext row, or the ID of the key that
+	// encrypted Data.
+	EncryptionKeyID      *string
 	CreatedAt            time.Time
 	MessageID            *string
+	// Role is set only when MessageID is set: who sent the archived message
+	// (e.g. "ROLE_USER", "ROLE_AGENT"), duplicated in plaintext from the
+	// encrypted Message so it stays queryable without decrypting.
+	Role                 *string
 	TaskPosition         *int64
 	InitialMessageID     *string
 	RequestHash          []byte
@@ -772,10 +812,15 @@ type agentInstanceTaskEventRow struct {
 }
 
 type taskEventWrite struct {
-	HistoryID            uuid.UUID
-	TaskID               *string
-	MessageID            *string
-	Data                 []byte
+	HistoryID uuid.UUID
+	TaskID    *string
+	MessageID *string
+	Data      []byte
+	// EncryptionKeyID is nil to store Data as plaintext, or the ID of the key
+	// that already encrypted it.
+	EncryptionKeyID *string
+	// Role is set only alongside MessageID; see agentInstanceTaskEventRow.Role.
+	Role                 *string
 	SnapshotAtespace     *string
 	SnapshotURI          *string
 	SnapshotContentScope *string
@@ -786,22 +831,29 @@ type taskEventWrite struct {
 }
 
 type taskHistoryRow struct {
-	TaskID string
-	Data   []byte
+	TaskID    string
+	MessageID *string
+	Data      []byte
+	// EncryptionKeyID is nil for a plaintext row, or the ID of the key that
+	// encrypted Data.
+	EncryptionKeyID *string
+	Role            *string
 }
 
 // insertTaskEvent appends an event and returns its sequence. Repeated message identities
 // within the same history and task return the original sequence without replacing content;
 // events without a message ID append independently. CreatedAt defaults to database time.
 // Callers serialize writes within a history and supply the transaction when persisting
-// related task changes.
+// related task changes. Callers that already have ciphertext (for example, copying an
+// event verbatim into a fork's history) pass it through Data/EncryptionKeyID unchanged;
+// this function never encrypts or decrypts.
 func insertTaskEvent(ctx context.Context, db dbExecutor, event taskEventWrite) (int64, error) {
 	return queryOne(ctx, db, `
 		WITH inserted AS (
 		    INSERT INTO agent_instance_task_event
-		        (history_id, task_id, message_id, data, snapshot_atespace, snapshot_uri, snapshot_content_scope,
-		         task_position, initial_message_id, request_hash, created_at)
-		    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, NOW()))
+		        (history_id, task_id, message_id, data, encryption_key_id, role, snapshot_atespace, snapshot_uri,
+		         snapshot_content_scope, task_position, initial_message_id, request_hash, created_at)
+		    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, COALESCE($13::timestamptz, NOW()))
 		    ON CONFLICT (history_id, task_id, message_id)
 		        WHERE message_id IS NOT NULL
 		    DO NOTHING
@@ -813,9 +865,9 @@ func insertTaskEvent(ctx context.Context, db dbExecutor, event taskEventWrite) (
 		WHERE history_id = $1 AND task_id IS NOT DISTINCT FROM $2 AND message_id = $3
 		LIMIT 1
 	`,
-		pgx.RowTo[int64], event.HistoryID, event.TaskID, event.MessageID, event.Data, event.SnapshotAtespace,
-		event.SnapshotURI, event.SnapshotContentScope, event.TaskPosition, event.InitialMessageID, event.RequestHash,
-		event.CreatedAt,
+		pgx.RowTo[int64], event.HistoryID, event.TaskID, event.MessageID, event.Data, event.EncryptionKeyID,
+		event.Role, event.SnapshotAtespace, event.SnapshotURI, event.SnapshotContentScope, event.TaskPosition,
+		event.InitialMessageID, event.RequestHash, event.CreatedAt,
 	)
 }
 
@@ -823,28 +875,31 @@ func insertTaskEvent(ctx context.Context, db dbExecutor, event taskEventWrite) (
 // history. Missing tasks return pgx.ErrNoRows; callers authorize access.
 func readAgentInstanceTask(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID string) (agentInstanceTaskRow, error) {
 	return queryOne(ctx, db, `
-		SELECT history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id,
-		    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position FROM
+		SELECT history_id, id, state, status_timestamp, data, encryption_key_id, created_at, updated_at,
+		    initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope,
+		    history_sequence, position FROM
 		    agent_instance_task
 		WHERE history_id = $1 AND id = $2
 	`, pgx.RowToStructByName[agentInstanceTaskRow], historyID, taskID)
 }
 
 // saveTaskProjection inserts or replaces current task state while preserving existing
-// creation, retry, and snapshot metadata. Callers validate the transition and persist its
-// events in the same transaction.
-func saveTaskProjection(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID, state string, statusTimestamp *time.Time, data []byte) (agentInstanceTaskRow, error) {
+// creation, retry, and snapshot metadata. Callers validate the transition, encrypt data
+// beforehand if configured, and persist its events in the same transaction.
+func saveTaskProjection(ctx context.Context, db dbExecutor, historyID uuid.UUID, taskID, state string, statusTimestamp *time.Time, data []byte, encryptionKeyID *string) (agentInstanceTaskRow, error) {
 	return queryOne(ctx, db, `
-		INSERT INTO agent_instance_task (history_id, id, state, status_timestamp, data)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO agent_instance_task (history_id, id, state, status_timestamp, data, encryption_key_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (history_id, id) DO UPDATE SET
 		    state = EXCLUDED.state,
 		    status_timestamp = EXCLUDED.status_timestamp,
 		    data = EXCLUDED.data,
+		    encryption_key_id = EXCLUDED.encryption_key_id,
 		    updated_at = NOW()
-		RETURNING history_id, id, state, status_timestamp, data, created_at, updated_at, initial_message_id,
-		    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope, history_sequence, position
-	`, pgx.RowToStructByName[agentInstanceTaskRow], historyID, taskID, state, statusTimestamp, data)
+		RETURNING history_id, id, state, status_timestamp, data, encryption_key_id, created_at, updated_at,
+		    initial_message_id, request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope,
+		    history_sequence, position
+	`, pgx.RowToStructByName[agentInstanceTaskRow], historyID, taskID, state, statusTimestamp, data, encryptionKeyID)
 }
 
 // readTaskMessages returns the latest historyLength archived messages per requested task
@@ -855,10 +910,10 @@ func readTaskMessages(ctx context.Context, db dbExecutor, historyID uuid.UUID, t
 		historyLength = nil
 	}
 	return queryMany(ctx, db, `
-		SELECT messages.task_id, messages.data
+		SELECT messages.task_id, messages.message_id, messages.data, messages.encryption_key_id, messages.role
 		FROM unnest($2::text[]) AS tasks(task_id)
 		CROSS JOIN LATERAL (
-		    SELECT task_id, data, sequence
+		    SELECT task_id, message_id, data, encryption_key_id, role, sequence
 		    FROM agent_instance_task_event
 		    WHERE history_id = $1 AND task_id = tasks.task_id AND message_id IS NOT NULL
 		    ORDER BY sequence DESC

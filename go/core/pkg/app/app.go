@@ -185,7 +185,15 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	defer db.Close()
-	store := database.NewClient(db)
+	var clientOpts []database.ClientOption
+	if keysFile := kagentenv.PayloadEncryptionKeysFile.Get(); keysFile != "" {
+		crypter, err := loadPayloadCrypter(keysFile)
+		if err != nil {
+			return fmt.Errorf("load payload encryption keys: %w", err)
+		}
+		clientOpts = append(clientOpts, database.WithPayloadCrypter(crypter))
+	}
+	store := database.NewClient(db, clientOpts...)
 
 	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{},
@@ -357,6 +365,22 @@ func env(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// loadPayloadCrypter reads and validates the task/event encryption keys file named by
+// PAYLOAD_ENCRYPTION_KEYS_FILE. Rotating keys is a matter of adding a new entry and
+// changing active_key_id in that file; every key that any stored row's encryption_key_id
+// might still name must stay present, or those rows become permanently undecryptable.
+func loadPayloadCrypter(path string) (*database.LocalKeyCrypter, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	keys, activeKeyID, err := database.LoadLocalKeysFromJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	return database.NewLocalKeyCrypter(keys, activeKeyID)
 }
 
 func envBool(name string) bool {

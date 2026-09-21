@@ -2,6 +2,7 @@ package database
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"slices"
 
@@ -164,8 +165,11 @@ func applyTaskEvent(stored *a2apb.Task, event *a2apb.StreamResponse) (*a2apb.Tas
 // replayTaskEvents rebuilds tasks solely from ordered immutable events through a
 // caller-selected boundary. It validates event identities and creation records and
 // restores creation order, retry metadata, and snapshot references. It does not read the
-// source's current task rows.
-func replayTaskEvents(events []agentInstanceTaskEventRow, contextID string) ([]agentInstanceTaskRow, error) {
+// source's current task rows. Each source event is decrypted using the key and AAD it was
+// originally encrypted with (its own task_id/message_id, which survive being copied into a
+// new history verbatim during fork); each rebuilt task projection is a fresh derivation, so
+// it is (re-)encrypted with the currently active key.
+func (c *Client) replayTaskEvents(ctx context.Context, events []agentInstanceTaskEventRow, contextID string) ([]agentInstanceTaskRow, error) {
 	tasks := make(map[string]*a2apb.Task)
 	indexes := make(map[string]int)
 	var rows []agentInstanceTaskRow
@@ -175,8 +179,12 @@ func replayTaskEvents(events []agentInstanceTaskEventRow, contextID string) ([]a
 			return nil, fmt.Errorf("invalid task event sequence or identity at %d", source.Sequence)
 		}
 		sequence = source.Sequence
+		plaintext, err := c.decryptPayload(ctx, source.Data, source.EncryptionKeyID, *source.TaskID, derefStr(source.MessageID))
+		if err != nil {
+			return nil, err
+		}
 		event := &a2apb.StreamResponse{}
-		if err := proto.Unmarshal(source.Data, event); err != nil {
+		if err := proto.Unmarshal(plaintext, event); err != nil {
 			return nil, err
 		}
 		decoded, err := pbconv.FromProtoStreamResponse(event)
@@ -221,7 +229,7 @@ func replayTaskEvents(events []agentInstanceTaskEventRow, contextID string) ([]a
 			return nil, err
 		}
 		row.State, row.StatusTimestamp = string(decodedTask.Status.State), decodedTask.Status.Timestamp
-		row.Data, err = proto.Marshal(task)
+		row.Data, row.EncryptionKeyID, err = c.encryptPayload(ctx, task, id, "")
 		if err != nil {
 			return nil, err
 		}

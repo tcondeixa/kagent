@@ -119,4 +119,13 @@ var (
 		"Verify required database migrations at startup without applying them.",
 		ComponentDatabase,
 	)
+
+	PayloadEncryptionKeysFile = RegisterStringVar(
+		"PAYLOAD_ENCRYPTION_KEYS_FILE",
+		"",
+		"Path to a JSON file (typically a mounted Secret) of task and event encryption keys: "+
+			`{"keys": {"<key id>": "<base64 32-byte key>"}, "active_key_id": "<key id>"}. `+
+			"When unset, task and event payloads are stored as plaintext, the default.",
+		ComponentDatabase,
+	)
 )

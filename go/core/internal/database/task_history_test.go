@@ -68,13 +68,13 @@ func TestTaskHistoryLimitsAndInstanceScope(t *testing.T) {
 func TestZeroTaskHistoryDoesNotQueryMessages(t *testing.T) {
 	task := &a2a.Task{ID: "task", History: []*a2a.Message{{ID: "inline"}}}
 	// No executor is needed when the caller asks to omit history.
-	require.NoError(t, loadAgentInstanceTaskHistories(context.Background(), nil, uuid.New(), []*a2a.Task{task}, new(0)))
+	require.NoError(t, (&Client{}).loadAgentInstanceTaskHistories(context.Background(), nil, uuid.New(), []*a2a.Task{task}, new(0)))
 	require.Empty(t, task.History)
 }
 
 func TestTaskHistoryLimitWithInlineMessages(t *testing.T) {
 	client := NewClient(setupTestDB(t))
 	task := &a2a.Task{ID: "task", History: []*a2a.Message{{ID: "first"}, {ID: "second"}, {ID: "third"}}}
-	require.NoError(t, loadAgentInstanceTaskHistories(t.Context(), client.db, uuid.New(), []*a2a.Task{task}, new(2)))
+	require.NoError(t, client.loadAgentInstanceTaskHistories(t.Context(), client.db, uuid.New(), []*a2a.Task{task}, new(2)))
 	require.Equal(t, []*a2a.Message{{ID: "second"}, {ID: "third"}}, task.History)
 }

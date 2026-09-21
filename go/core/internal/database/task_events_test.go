@@ -31,12 +31,12 @@ func TestTaskViewsRebuildFromEvents(t *testing.T) {
 	assertReplay := func() {
 		t.Helper()
 		events, err := queryMany(ctx, q, `
-			SELECT sequence, history_id, task_id, data, created_at, message_id, task_position, initial_message_id,
-			    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope FROM agent_instance_task_event WHERE
-			    history_id = $1 ORDER BY sequence
+			SELECT sequence, history_id, task_id, data, encryption_key_id, created_at, message_id, role,
+			    task_position, initial_message_id, request_hash, snapshot_atespace, snapshot_uri,
+			    snapshot_content_scope FROM agent_instance_task_event WHERE history_id = $1 ORDER BY sequence
 		`, pgx.RowToStructByName[agentInstanceTaskEventRow], instanceRow.HistoryID)
 		require.NoError(t, err)
-		rows, err := replayTaskEvents(events, instance.ContextId)
+		rows, err := client.replayTaskEvents(ctx, events, instance.ContextId)
 		require.NoError(t, err)
 		require.NotEmpty(t, rows)
 		for _, rebuilt := range rows {
@@ -115,12 +115,12 @@ func TestTaskViewsRebuildFromEvents(t *testing.T) {
 	assertReplay()
 	// A source task changing or even losing its view must not affect an old fork.
 	events, err := queryMany(ctx, q, `
-		SELECT sequence, history_id, task_id, data, created_at, message_id, task_position, initial_message_id,
-		    request_hash, snapshot_atespace, snapshot_uri, snapshot_content_scope FROM agent_instance_task_event WHERE
-		    history_id = $1 ORDER BY sequence
+		SELECT sequence, history_id, task_id, data, encryption_key_id, created_at, message_id, role,
+		    task_position, initial_message_id, request_hash, snapshot_atespace, snapshot_uri,
+		    snapshot_content_scope FROM agent_instance_task_event WHERE history_id = $1 ORDER BY sequence
 	`, pgx.RowToStructByName[agentInstanceTaskEventRow], instanceRow.HistoryID)
 	require.NoError(t, err)
-	rows, err := replayTaskEvents(events, instance.ContextId)
+	rows, err := client.replayTaskEvents(ctx, events, instance.ContextId)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, "DELETE FROM agent_instance_task WHERE history_id = $1", instanceRow.HistoryID)
 	require.NoError(t, err)
@@ -141,10 +141,10 @@ func TestTaskViewsRebuildFromEvents(t *testing.T) {
 	require.False(t, created)
 	// Missing creation, out-of-order events, and identity corruption fail closed.
 	for _, broken := range [][]agentInstanceTaskEventRow{boundaryEvents[1:], {boundaryEvents[0], boundaryEvents[0]}} {
-		_, err := replayTaskEvents(broken, instance.ContextId)
+		_, err := client.replayTaskEvents(ctx, broken, instance.ContextId)
 		require.Error(t, err)
 	}
-	_, err = replayTaskEvents(boundaryEvents, uuid.NewString())
+	_, err = client.replayTaskEvents(ctx, boundaryEvents, uuid.NewString())
 	require.Error(t, err)
 	// Reclamation must record its failure transition, not just its message.
 	active := newAgentInstanceTask("interrupted", "next-message")
