@@ -5,28 +5,26 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 )
+
+var immutableGitCommit = regexp.MustCompile(`^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
 
 // CloneGit fetches a single git ref into ref.Dest. All user-controlled
 // strings (URL, Ref, SubPath) are passed to git as separate argv entries via
 // exec.Command — they never pass through a shell, so metacharacters in any of
 // them are inert.
 //
-// When ref.Full is true we do a full clone then `git checkout <sha>`,
-// because shallow `--branch` does not accept commit SHAs. When false we use a
+// When ref.Full is true the ref is a full commit SHA; we use CloneGitCommit
+// (git init + fetch --depth 1 origin <sha>) which is the only reliable way to
+// fetch a pinned commit without cloning the full history. When false we use a
 // depth-1 branch/tag clone.
 //
 // SubPath, if set, rewrites the destination so the final layout matches the
 // requested in-repo subdirectory.
 func CloneGit(ref GitRef) error {
 	if ref.Full {
-		if err := runGit("clone", "--", ref.URL, ref.Dest); err != nil {
-			return err
-		}
-		// `--` separator prevents a ref starting with `-` from being parsed
-		// as a flag. Refs are already validated upstream as 40-char hex when
-		// Full is true, but defense in depth costs nothing.
-		if err := runGitIn(ref.Dest, "checkout", "--", ref.Ref); err != nil {
+		if err := CloneGitCommit(ref.URL, ref.Ref, ref.Dest); err != nil {
 			return err
 		}
 	} else {
@@ -41,6 +39,32 @@ func CloneGit(ref GitRef) error {
 		}
 	}
 	return nil
+}
+
+// CloneGitCommit fetches only one immutable commit instead of cloning the
+// repository's complete history. It uses git init + fetch --depth 1 which
+// works for pinned SHAs that shallow --branch does not accept. The destination
+// is removed and re-initialised on every call so retries start clean.
+func CloneGitCommit(url, commit, destination string) error {
+	if !immutableGitCommit.MatchString(commit) {
+		return fmt.Errorf("git commit must be a full SHA")
+	}
+	if err := os.RemoveAll(destination); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return err
+	}
+	if err := runGitIn(destination, "init"); err != nil {
+		return err
+	}
+	if err := runGitIn(destination, "remote", "add", "origin", url); err != nil {
+		return err
+	}
+	if err := runGitIn(destination, "fetch", "--depth", "1", "origin", commit); err != nil {
+		return err
+	}
+	return runGitIn(destination, "checkout", "--detach", "FETCH_HEAD")
 }
 
 func runGit(args ...string) error {

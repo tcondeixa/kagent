@@ -361,9 +361,6 @@ func needsSRTSettings(agent v1alpha2.AgentObject, sandboxCfg *v1alpha2.SandboxCo
 	if spec.Type == v1alpha2.AgentType_BYO {
 		return sandboxCfg != nil
 	}
-	if spec.Skills != nil {
-		return true
-	}
 	return spec.Declarative != nil &&
 		spec.Declarative.ExecuteCodeBlocks != nil &&
 		*spec.Declarative.ExecuteCodeBlocks
